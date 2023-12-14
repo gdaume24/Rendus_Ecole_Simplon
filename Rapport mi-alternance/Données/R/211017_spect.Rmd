@@ -1,0 +1,1389 @@
+---
+title: "SPECT data script"
+author: "Damien Legallois et Alain Manrique"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  html_document:
+    toc: yes
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+# ici on dit qu'on ne veut pas que les messages d'erreur arrivent dans le document produit
+library(stringr)     # gestion des chaînes de caractère
+library(dplyr)       # gestion des instructions en cascade
+library(data.table)  # gestion des tables
+library(lubridate)   # gestion des dates
+library(readxl)      # lit les fichiers Excel
+library(reshape2)    # permet d'assigner dans des fonctions
+library(tableone)    # création de la table de probabilité
+library(kableExtra)  # jolies tables
+library(knitr)       # interaction LaTeX et R
+library(Hmisc)       # permet d'utiliser describe() pour les stat de données qualitatives
+knitr::opts_chunk$set(echo = TRUE) #car sinon avec FALSE, le code n'apparaît jamais
+```
+
+# Considérations générales
+
+## Configuration
+
+On commence par effacer les données en mémoire, puis détermination du répertoire courant
+```{r}
+rm(list=ls())
+setwd("~/Documents/Cardio/Publis-Protocoles/2004 - Data mining SPECT/v1-R_markdown/")
+filename <- "scinti_fusion.xls"
+filename_prenoms <- "nat2021.csv"
+```
+
+## Fonctions
+### Fonction de désaccentuation
+```{r}
+Unaccent <- function(text) {
+  text <- gsub("['`^~\"]", " ", text)
+  text <- iconv(text, to="ASCII//TRANSLIT//IGNORE")
+  text <- gsub("['`^~\"]", "", text)
+  return(text)
+}
+```
+
+### Fonction pour tout mettre en minuscule
+```{r}
+ToutEnMinuscule <- function(input) {
+  gsub(pattern = "\\s", replacement = "", x = input) %>%
+    str_to_lower() %>%
+    {gsub('[[:punct:] ]+','',.)} %>%
+    {iconv(., to="ASCII//TRANSLIT//IGNORE")} %>%
+    {gsub("['`^~\"]", "",.)} ->
+    output
+}
+```
+# Lecture des données sources
+## Import des données
+
+Lecture du fichier Excel importé de GERA, et transformation en data.frame pour manipuler plus facilement les colonnes.
+```{r, message=FALSE, warning=FALSE, results='hide'}
+spect <- as.data.table(read_xls(filename))
+spect <- as.data.frame(spect)
+```
+
+On peut ensuite définir un filtre sur le prénom ou le nom, cela permet surtout de travailler sur un morceau de base plus petit, plus pratique en phase de développement. Annoter ces lignes pour utiliser l'ensemble de la base
+```{r}
+#  spect <- subset(spect, Nom %like% "LAI*")
+#  spect <- subset(spect, Prénom=="Dominique")
+```
+
+## Réorganisation des données
+
+On renomme les colonnes importées de GERA. Les champs nom et prénom sont suivi d'un underscore pour signaler le fait qu'il s'agit de champ temporaire. Dans la mesure où la base doit être anonymisée, ces champs devront être détruits.
+```{r}
+names(spect)[1] <- 'date'
+names(spect)[2] <- 'npp'
+names(spect)[3] <- 'dossier'
+names(spect)[4] <- 'nom_'    # _ car temporaire, sera anonymisé
+names(spect)[5] <- 'prenom_' # _ car temporaire, sera anonymisé
+names(spect)[6] <- 'ddn'
+names(spect)[7] <- 'protocole'
+names(spect)[8] <- 'service'
+names(spect)[9] <- 'statut'
+```
+
+Les colonnes créées par GERA sont ensuite en nombre aléatoire - sans que leur nombre ne suive en apparence une certaine logique. En revanche, les informations qu'elles contiennent sont fondamentales (indication de l'examen, données cliniques, résultats de la scintigraphie myocardique de perfusion, etc.). On va donc renommer une à une toutes ces colonnes en les appelant avec le préfixe data_spect au moyen d'une boucle. Puis, on concatène toutes les colonnes qui commencent par ce préfixe data_spect. La colonne aux données concaténées est conservée mais toutes les colonnes temporaires sont effacées.
+```{r}
+pattern = "data_spect"
+for (i in 10:ncol(spect)) {
+  names(spect)[i] <- paste0(pattern,i)
+}
+spect$spectdata = do.call(paste, spect[,grepl(pattern, names(spect))])
+spect <- spect %>%
+  select(-starts_with("data_spect"))
+```
+
+## Codage du sexe
+
+On importe le fichier csv pour comparer le prénom à l'année de naissance et définir quel est le sexe le plus probable. Ensuite on décharge ce gros fichier.
+```{r}
+  gender_ <- read.csv2(filename_prenoms, sep = ",")
+  gender_$concatenation <- Unaccent(ToutEnMinuscule(gender_$concatenation))
+  gender_ <- distinct(gender_)
+  spect$concatenation <- paste0(year(spect$ddn),Unaccent(ToutEnMinuscule(spect$prenom_)))
+  spect<-merge(x=spect,y=gender_,by="concatenation",all.x=TRUE)
+```
+
+## Codage des périodes
+
+Codage des périodes, par exemple p2019 pour un examen réalisé en 2019, etc. Puis, on code en fonction du jour de l'année si nous sommes en pré-lockdown, en lockdown, etc. et les niveaux sont ordonnées pour que la séquence soit logique (pré-lockdown, puis lockdown, puis post-lockwon, etc.). Les données sont filtrées pour supprimer les examens qui ne nous intéressent pas et on élimine les classes qui ne nous intéressent pas avec un droplevel.
+```{r}
+as.POSIXct(spect$date, format="%Y-%m-%d") %>%
+  year() %>%
+  {paste0("p", .)} %>%
+  as.factor() ->
+  spect$periode
+spect$date <- floor_date(spect$date, "day")
+
+date_lockdown  <-  ymd("2020-03-17")
+
+spect$groupe <- time_length(
+  interval(start = date_lockdown, end = spect$date), unit = "days"
+  )
+
+spect$groupe<- as.factor(case_when(
+  spect$groupe> 0 & spect$groupe< 56 ~ "lockdown",
+  spect$groupe> 55 & spect$groupe< 111 ~ "post+1",
+  spect$groupe> 110 & spect$groupe< 166 ~ "post+2",
+  spect$groupe> 165 & spect$groupe< 221 ~ "post+3",
+  spect$groupe> 220 & spect$groupe< 276 ~ "post+4",
+  spect$groupe> -56 & spect$groupe< 1 ~ "pre-1",
+  spect$groupe> -111 & spect$groupe< -55 ~ "pre-2",
+  spect$groupe> -166 & spect$groupe< -110 ~ "pre-3",
+  spect$groupe> -221 & spect$groupe< -165 ~ "pre-4",
+  TRUE ~ "trash"
+))
+
+spect$groupe<- ordered(spect$groupe, levels = c("pre-4", "pre-3", "pre-2", "pre-1", "lockdown", "post+1", "post+2", "post+3", "post+4", "trash"))
+
+#spect <- subset(spect, spect$periode != "pNA")
+#spect <- subset(spect, spect$groupe != "trash")
+spect <- droplevels(spect)
+```
+
+## Champ de recherche et anonymisation
+
+On met en place un champ nommé saerch dans lequel on cherchera le texte. La fonction ToutEnMinuscule est appliquée au champ concaténé créé quelques lignes au dessus. Ensuite, on anonymise et on calcule l'âge à partir de la date de naissance et la date de l'examen.
+
+```{r}
+spect$search <- ToutEnMinuscule(spect$spectdata)
+
+spect$nom <- substr(spect$nom,1,3)
+spect$prenom <- substr(spect$prenom,1,2)
+spect$date_exam <- as.Date(spect$`date`)
+
+interval(spect$ddn, spect$date_exam) %>% #calcul de l'âge
+  {time_length(., "years")} %>%
+  floor() %>%
+  as.numeric() ->
+  spect$age
+```
+
+## Nettoyage
+```{r, message=FALSE, warning=FALSE, results='hide'}
+rm(pattern, i, gender_)
+spect <- spect %>%
+  select(-c(nom_,prenom_,date,npp,dossier,service,statut,concatenation))
+```
+
+# Tri des examens
+
+On retire les protocoles où l'objectif n'est pas de chercher de l'ischémie.
+```{r}
+gsub(pattern = "\\s", replacement = "", x = spect$protocole) %>% 
+  str_to_lower() ->
+  spect$protocole_temp
+pattern <- "viab|tepscan|amylose|f.e.v.g|os"
+spect <- subset(spect, spect$protocole_temp %like% pattern == FALSE)
+```
+
+On retire également les patients ayant une cardiopathie congénitale.
+```{r}
+pattern <- "doublediscord|transposition|vdsystemique"
+spect <- subset(spect, spect$search %like% pattern == FALSE)
+rm(pattern)
+```
+
+# Traitement des données
+## Cardiopathie
+
+Les termes fréquemment retrouvés en majuscule et qui seront bien plus difficiles à identifier si tout est concaténé en minuscule sont identifiés au départ, le texte est ensuite transformé sans accents, sans ponctuation et sans majuscule. On coupe également après le terme acquisition afin de ne pas retrouvé des mots évocateurs de cardiopathie dans la conclusion, ce qui ferait - à tort - classer le patient comme étant coronarien alors que ce n'est pas le cas.
+
+```{r}
+gsub(pattern = " SCA", replacement = "atcdsyndromecoronarienaigu", x = spect$spectdata) %>% 
+  {gsub(pattern = " CD", replacement = "coronairedroite", x = .)} %>%
+  {gsub(pattern = " IVA", replacement = "interventriculaireanterieure", x = .)} %>%
+  {gsub(pattern = " ST\\+", replacement = "infarctus", x = .)} %>%
+  ToutEnMinuscule() %>% 
+  Unaccent() %>% 
+  {gsub("acquisition.*", "", .)} ->
+  spect$search_sca
+```
+
+### CMD
+```{r}
+pattern <- "cmd|cardiopathiedilate|cardiomyopathiedilate"
+spect$cmd <- ifelse(spect$search %like% pattern == TRUE,"cmd","no_cmd")
+spect$cmd <- ordered(spect$cmd, levels = c("no_cmd", "cmd"))
+```
+
+### CMI
+On recherche soit des patterns évocateurs de CMI ou au contraire en faveur d'une absence d'ATCD CV.
+```{r}
+pattern <- "suividecmi|suivicmi|scastt|scast|suividunecmi|syndromecoronarienaigu"
+spect$cmi <- ifelse(spect$search_sca %like% pattern == TRUE,"CAD","inconnu")
+pattern <- "atcdcv0|atcdcvaucun"
+spect$cmi <- ifelse(
+  spect$cmi=="inconnu",ifelse(
+      spect$search_sca %like% pattern == TRUE,"No_CAD","inconnu"
+      ),
+  as.character(spect$cmi)
+  )
+```
+
+S'il y a un terme coro/angioplastie/stent + un nom de vaisseau, alors il existe probablement une CMI. Les mots IVA et CD ont été transformés avant pour éviter de chercher "iva" qu'on retrouverait par exemple dans ivabradine ou rivaroxaban si on ne prenait pas cette précaution. Idem pour la CD. Si on a une coro (1 point) et un nom de vaisseau (1 point) alors il st probable qu'il y ait une CMI si on a 2 points. Pour les patients qui ont encore un statut inconnu quant à l'existence d'une CMI, on considère alors qu'il n'y en a pas, les recherches ayant été vaines.
+```{r}
+pattern <- "coro|angioplastie|stent"
+pattern2 <- "cx|interventriculaire|coronairedroite|circonflexe|diagonale|marginale|retroventriculaire"
+cmi0 <- ifelse(spect$search_sca %like% pattern == TRUE,1,0)
+cmi1 <- ifelse(spect$search_sca %like% pattern2 == TRUE,1,0)
+spect$cmi <- ifelse(spect$cmi=="inconnu",ifelse(cmi0+cmi1 == 2,"CAD","inconnu"), as.character(spect$cmi))
+spect$cmi <- ifelse(spect$cmi == "inconnu", "No_CAD", as.character(spect$cmi))
+spect$cmi <- ordered(spect$cmi, levels = c("No_CAD", "CAD"))
+```
+
+### ATCD Infarctus
+On supprime les termes "décédé(e) d'un" car ces termes ne sont utilisés que pour décrire des ATCD familiaux et ils ont l'inconvénient d'éloigner l'individu (ex: père) et le terme (ex: infarctus), ce qui (i) complique la recherche d'ATCD familiaux, et (ii) risque à tort de qualifier le patient comme ayant un ATCD d'infarctus alors qu'il s'agissait d'un parent. On cherche ensuite un maximum de patterns évocateurs d'un ATCD familial de CMI et on remplace ce terme - hétérogène - par "hereditecor", ce qui permettra plus facilement de rechercher les ATCD familiaux quand on les classera un peu plus loin.
+```{r}
+pattern_hereditecor <- "decededun|decedeedun"
+spect$search_sca <- gsub(pattern = pattern_hereditecor, replacement = "", x = spect$search_sca)
+pattern_hereditecor <- "idmchez|idmpere|idmmere|idmfrere|idmsoeur|stentchez|stentpere|stentmere|stentfrere|stentsoeur|cousinsidm|pereidm|mereidm|frereidm|freresidm|soeursidm|soeuridm|pereinfarctus|mereinfarctus|frereinfarctus|soeurinfarctus|perestent|merestent|frerestent|soeurstent|peretriplepontage|triplepontagechezlepere|peredoublepac"
+spect$search_sca <- gsub(pattern = pattern_hereditecor,
+    replacement = "hereditecor", x = spect$search_sca)
+```
+
+Après avoir éliminé les termes qui pouvaient - par erreur - faire dire que le patient a des antécédents d'infarctus, alors on cherche des patterns d'infarctus
+```{r}
+pattern_AMI <- "infarctus|idm|atcdsyndromecoronarienaigu"
+spect$history_MI <- ifelse(
+  spect$cmi!="NON", ifelse(
+    spect$search_sca %like% pattern_AMI == TRUE,"AMI","No_AMI"
+    ),
+  "No_AMI"
+  )
+spect$history_MI <- ordered(spect$history_MI, levels = c("No_AMI", "AMI"))
+```
+
+### Pontage coronaire
+1. On va éviter de rechercher l'existence d'un PAC trop proche d'un apparenté, on va donc chercher à localiser un de ces termes et on va remplacer tout le texte autour par ATCDFAM, afin de détruire de notre chaine de recherche un PAC chez un membre de la famille. Si la recherche n'a rien donné, on peux continuer à chercher dans le champ search_sca qu'on a utilisé précédemment.
+```{r}
+ToutEnMinuscule(spect$spectdata) %>% 
+  Unaccent() %>% 
+  {gsub(pattern = "pere|mere|soeur|frere", replacement = "apparenté", x = .)} -> 
+  spect$search_CABG
+  
+pere <- as.data.frame(str_locate(spect$search_CABG, "apparenté"))
+str_sub(spect$search_CABG, pere$start -15, pere$start +35) <- "ATCDFAM"
+spect$search_CABG <- ifelse(
+  is.na(spect$search_CABG), spect$search_sca, spect$search_CABG
+  )
+```
+
+2. On supprime les autres situations où on peut croiser les lettres "pac"
+```{r}
+pattern_pac <- "pacemaker|paclitax|capacit|noncompaction"
+pattern_CABG <- "ponte|doublepontage|triplepontage|pontagemig|pontagemid|pontagemammaire|pontageaortocoronarien"
+spect$search_CABG <- gsub(pattern = pattern_pac, replacement = "", x = spect$search_CABG) 
+spect$cabg <- ifelse(
+  spect$search_CABG %like% pattern_CABG == TRUE,"CABG","No_CABG"
+  )
+spect$cabg <- ordered(spect$cabg, levels = c("No_CABG", "CABG"))
+```
+
+### PCI
+On fait la recherche sur le champ search_CABG car le rationnel est le même : éviter que des stents chez le père ne fasse croire que le patient index a déja eu des stents. Ensuite, on supprime les termes de revascularisation périphérique qui peuvent aussi être confusant. Enfin, on qualifie l'existence ou non d'une revascularisation percutanée.
+```{r}
+pattern_aomi<- "angioplastiefemora|angioplastieilia|stentfemora|stentilia|aomistent"
+pattern_PCI <- "stent|angioplastie|thrombolyse|fibrinolyse"
+spect$search_CABG <- gsub(pattern = pattern_aomi, replacement = "", x = spect$search_CABG)
+spect$pci <- ifelse(
+  spect$cmi != "NON", ifelse(
+    spect$search_CABG %like% pattern_PCI == TRUE,"PCI","No_PCI"
+    ),
+  "No_PCI"
+  )
+spect$pci <- ordered(spect$pci, levels = c("No_PCI", "PCI"))
+```
+
+### Revascularisation
+Tout simplement fonction de la présence ou non d'une angioplastie et/ou d'un PAC. S'il existe une revascularisation coronaire, on force le champ CMI si la CMI n'avait pas été identifié au préalable.
+```{r}
+spect$revascularization <- ifelse(
+  spect$cabg == "No_CABG", ifelse(
+    spect$pci == "No_PCI", "no-revascularization", "revascularization"
+    ),
+  "revascularization"
+  )
+
+spect$cmi <- ifelse(
+  spect$revascularization == "revascularization", "CAD", as.character(spect$cmi)
+  )
+spect$cmi <- ordered(spect$cmi, levels = c("No_CAD", "CAD"))
+
+spect$revascularization <- ordered(spect$revascularization, levels = c("no-revascularization", "revascularization"))
+```
+
+### Nettoyage
+Le camp search_sca n'est pas éliminé à ce stade car il resservira plus tard.
+```{r, message=FALSE, warning=FALSE, results='hide'}
+rm(pere,cmi0,cmi1)
+rm(list = apropos("pattern"))
+spect <- spect %>%
+  select(-c(search_CABG,protocole_temp))
+```
+
+## Antécédents et caractéristiques
+
+### Antecedent de Cancer 
+```{r}
+pattern <- "adenocar|adk|epidermoid|tumeur|cancer|remission|chimio|radiother|metastase|carcinome|lymphome|immunotherap|neoplasie|anthracycline"
+spect$cancer <- ifelse(spect$search %like% pattern == TRUE, "cancer", "no_cancer")
+spect$cancer <- ordered(spect$cancer, levels = c("no_cancer", "cancer"))
+```
+
+### COVID 
+```{r}
+pattern <- "covid|sarscov2"
+spect$covid <- ifelse(spect$search %like% pattern == TRUE, "covid", "no_covid")
+spect$covid <- ordered(spect$covid, levels = c("no_covid", "covid"))
+```
+
+### Nettoyage
+```{r, message=FALSE, warning=FALSE, results='hide'}
+rm(list = apropos("pattern"))
+```
+
+## Indications de l'examen
+
+On commence par les bilans pré-op car on peut être en bilan pré-op avant tout sur CMI
+```{r}
+pattern_indication_preop <- "bilanpreop|bilanpredilatation|avantchirurgie|prechirurgie|avanttransplantation|pretransplantation"
+spect$indication_exam<- ifelse(
+  spect$search %like% pattern_indication_preop == TRUE,"Bilan pre-op","inconnu"
+  )
+```
+
+Puis, si c'est écrit "recherche d'ischémie" => recherche d'ischémie
+```{r}
+pattern_indication_diag <- "recherchedischemie|rechercheischemie|rechercheduneischemie|depistageischemie|depistagedischemie|depistageduneischemie"
+spect$indication_exam <- ifelse(
+  spect$indication_exam=="inconnu", ifelse(
+      spect$search %like% pattern_indication_diag == TRUE,"Recherche d'ischemie","inconnu"
+      ),
+  spect$indication_exam
+  )
+```
+
+Sinon, c'est un suivi de CMI si on retrouve ce pattern de texte ou si les patients ont une CMI connue et que l'indication n'est pas encore classée
+```{r}
+pattern_indication_suividecmi <- "suividecmi|suivicmi|suividunecmi"
+spect$indication_exam <- ifelse(
+  spect$indication_exam=="inconnu", ifelse(
+    spect$search %like% pattern_indication_suividecmi == TRUE,"Suivi de CMI","inconnu"
+    ),
+  spect$indication_exam
+  )
+
+spect$indication_exam <- ifelse(
+  spect$indication_exam=="inconnu", ifelse(
+    spect$cmi =="CAD","Suivi de CMI","inconnu"
+    ),
+  spect$indication_exam
+  )
+```
+
+Indications particulières. Sinon, recherche d'ischémie.
+```{r}
+pattern_indication_diag <- "viabilite"
+spect$indication_exam <- ifelse(
+  spect$indication_exam=="inconnu", ifelse(
+    spect$search %like% pattern_indication_diag == TRUE,"Viabilite","inconnu"
+    ),
+  spect$indication_exam
+  )
+
+pattern_indication_diag <- "amylose"
+spect$indication_exam <- ifelse(
+  spect$indication_exam=="inconnu", ifelse(
+    spect$search %like% pattern_indication_diag == TRUE,"suspicion amylose ATTR","inconnu"
+    ),
+  spect$indication_exam
+  )
+
+pattern_indication_diag <- "asymptomatique|depistage|coroscanner|bilandedyspnee|evaluationdelareserve|recherchedecardiopathie|troublesderepolarisation|troublesdelarepolarisation|troublederepolarisation|troubledelarepolarisation|atteintedelamicrocirculation|bbg"
+spect$indication_exam <- ifelse(
+  spect$indication_exam=="inconnu", ifelse(
+    spect$search %like% pattern_indication_diag == TRUE,"Recherche d'ischemie","inconnu"
+    ),
+  spect$indication_exam
+  )
+
+pattern_indication_diag <- "sarcoidose"
+spect$indication_exam <- ifelse(
+  spect$indication_exam=="inconnu", ifelse(
+    spect$search %like% pattern_indication_diag == TRUE,"Sarcoidose","inconnu"
+    ),
+  spect$indication_exam
+  )
+
+spect$indication_exam <- ordered(spect$indication_exam, levels = c("Suivi de CMI", "Recherche d'ischemie", "Viabilite", "suspicion amylose ATTR", "Sarcoidose", "inconnu"))
+
+```
+
+### Nettoyage
+```{r, message=FALSE, warning=FALSE, results='hide'}
+rm(list = apropos("pattern"))
+```
+
+## FDRCV
+
+On commence par remplacer quelques abréviations qui ne seront pas facile à retrouver par la suite. Ensuite, on va dérouler les FDRCV un à un en commençant systématiquement par rechercher des termes négatifs.
+```{r}
+gsub(pattern = " HCL| HCT", replacement = "dyslipidemie", x = spect$spectdata) %>% 
+  {gsub(pattern = " DNID| DT2| DID| DT1", replacement = "diabete", x = .)} %>% 
+  ToutEnMinuscule() ->
+  spect$search_fdrcv 
+```
+ 
+### HTA
+```{r}
+spect$search_fdrcv <- str_remove(spect$search_fdrcv, "pasdhta|nihta")
+pattern_HTA <- "hta"
+spect$Hypertension <- ifelse(
+  spect$search_fdrcv %like% pattern_HTA == TRUE,"HTN","No_HTN"
+  )
+spect$Hypertension <- ordered(spect$Hypertension, levels = c("No_HTN", "HTN"))
+spect$CVRF <- as.numeric(ifelse(
+  spect$Hypertension == "HTN", 1, 0
+))
+```
+
+### Diabète 
+```{r}
+spect$search_fdrcv <- str_remove(spect$search_fdrcv, "pasdediabete|nidiabete")
+pattern_Diabetes <- "diabete"
+spect$diabetes <- ifelse(
+  spect$search_fdrcv %like% pattern_Diabetes == TRUE,"Diabetes","No_Diabetes"
+  )
+spect$diabetes <- ordered(spect$diabetes, levels = c("No_Diabetes", "Diabetes"))
+spect$CVRF <- as.numeric(ifelse(
+  spect$diabetes == "Diabetes", spect$CVRF+1, spect$CVRF
+))
+```
+
+### Tabagisme 
+```{r}
+spect$search_fdrcv <- str_remove(spect$search_fdrcv, "pasdetaba|nitaba")
+pattern_Tabacco <- "tabagisme|tabac"
+spect$tabacco <- ifelse(
+  spect$search_fdrcv %like% pattern_Tabacco == TRUE,"Tabacco","No_Tabacco"
+  )
+spect$tabacco <- ordered(spect$tabacco, levels = c("No_Tabacco", "Tabacco"))
+spect$CVRF <- as.numeric(ifelse(
+  spect$tabacco == "Tabacco", spect$CVRF+1, spect$CVRF
+))
+```
+
+### Dyslipidémie
+```{r}
+spect$search_fdrcv <- str_remove(spect$search_fdrcv, "pasdedyslipidemie|nidyslipi|nihyperchol")
+pattern_HCT <- "dyslipidemie|cholesterol|hypertriglycerid"
+spect$Dyslipidemia <- ifelse(
+  spect$search_fdrcv %like% pattern_HCT == TRUE,"Dyslipidemia","No_Dyslipidemia"
+  )
+spect$Dyslipidemia <- ordered(spect$Dyslipidemia, levels = c("No_Dyslipidemia", "Dyslipidemia"))
+spect$CVRF <- as.numeric(ifelse(
+  spect$Dyslipidemia == "Dyslipidemia", spect$CVRF+1, spect$CVRF
+))
+```
+
+### AOMI 
+```{r}
+spect$search_fdrcv <- gsub(pattern = "iaominime", replacement = "IA", x = spect$search_fdrcv)
+pattern_AOMI <- "aomi|carotid|endarteriec|iliaque|aaa|claudication|pontagefemoro|pontageaortofemo|pontageaortoili|arterit|anevrismeaort|anevrismedelaorte|chirurgiedelaorte|arteriopathie|anevrysmeaort|anevrysmedelaorte"
+spect$PAR <- ifelse(
+  spect$search_fdrcv %like% pattern_AOMI == TRUE,"PAD","No_PAD"
+  )
+spect$PAR <- ordered(spect$PAR, levels = c("No_PAD", "PAD"))
+```
+
+### Hérédité coronaire
+Il faut transformer le terme "coronarienne" qui est utilisé exclusivement pour hérédité coronarienne, on le change en "hereditecor", qui sera utilisé plus loin pour reconnaitre une hérédité coronarienne. C'est pour cette recherche qu'on a gardé search_sca jusque là.
+```{r}
+spect$search_sca <- gsub(pattern = "pasdhereditecoronarienne|nihereditecoronarienne", replacement = "", x = spect$search_sca)
+spect$search_sca <- gsub(pattern = "coronarienne", replacement = "heredite", x = spect$search_sca)
+pattern_heredite <- "heredite"
+spect$familial_history_cad <- ifelse(
+  spect$search_sca %like% pattern_heredite == TRUE,"Familial_history_CAD","No_FH_CAD"
+  )
+spect$familial_history_cad <- ordered(spect$familial_history_cad, levels = c("No_FH_CAD", "Familial_history_CAD"))
+spect$CVRF <- as.numeric(ifelse(
+  spect$familial_history_cad == "Familial_history_CAD", spect$CVRF+1, spect$CVRF
+))
+```
+
+### Nettoyage
+```{r, message=FALSE, warning=FALSE, results='hide'}
+rm(list = apropos("pattern"))
+spect <- spect %>%
+  select(-c(search_sca,search_fdrcv))
+```
+
+## Données cliniques
+
+### BBG 
+```{r}
+pattern_BBG <- "bbg|blocdebranchegauche|blocgauche"
+spect$LBBB <- ifelse(
+  spect$search %like% pattern_BBG == TRUE,"LBBB","No_LBBB"
+  )
+spect$LBBB <- ordered(spect$LBBB, levels = c("No_LBBB", "LBBB"))
+```
+
+### FA
+```{r}
+pattern_FA <- "acfa|faperman|faparox|fapersis|flutter|fibrillationa"
+gsub(pattern = " FA ", replacement = "faparox", x = spect$spectdata) %>% 
+  ToutEnMinuscule() %>%
+  Unaccent() %>% 
+  {ifelse(. %like% pattern_FA == TRUE,"AF","No_AF")} ->
+  spect$AF
+spect$AF <- ordered(spect$AF, levels = c("No_AF", "AF"))
+```
+
+### IMC
+La valeur est limitée à 2 chiffres.
+```{r}
+str_to_lower(gsub(pattern = "\\s", replacement = "", x = spect$search)) %>% 
+  {gsub(pattern = ":", replacement = "", x = .)} %>% 
+  {gsub(".*imc", "", .)} %>% 
+  {gsub("patient.*", "", .)} %>% 
+  {gsub("recher.*", "", .)} %>% 
+  {gsub("suivi.*", "", .)} %>% 
+  {gsub("bilan.*", "", .)} %>% 
+  {gsub("kg.*", "", .)} %>% 
+  {gsub(pattern = "a", replacement = "", x = .)} %>% 
+  {substr(.,1,2)} %>% 
+  as.character() %>% 
+  as.numeric() ->
+  spect$BMI
+
+spect$overweight <- ifelse(spect$BMI >= 30, "obesity", ifelse(spect$BMI < 25, "no_overweight", "overweight"))
+spect$overweight <- ordered(spect$overweight, levels = c("no_overweight", "overweight", "obesity"))
+
+spect$CVRF <- as.numeric(ifelse(
+  spect$overweight != "no_overweight", spect$CVRF+1, spect$CVRF
+))
+
+```
+
+### Nettoyage
+```{r, message=FALSE, warning=FALSE, results='hide'}
+rm(list = apropos("pattern"))
+```
+
+## Traitements
+Il faut couper à partir des résultats pour ne pas qu'un traitement proposé en conclusion soit considéré comme présent au début. Il faut aussi garder une trace de quelques termes comme IEC, pour ne pas être confondu avec scintigraph**iec**ardiaque.
+```{r}
+gsub(pattern = "K160|K75|AAP", replacement = "aspirine", x = spect$spectdata) %>% 
+  {gsub(pattern = "AVK|AOD|NACO", replacement = "warfarin", x = .)} %>% 
+  {gsub(pattern = "IEC|ARA2|ARAII", replacement = "entresto", x = .)} %>% 
+  {gsub("acquisition.*", "", .)} %>% 
+  ToutEnMinuscule() %>%
+  Unaccent() ->
+  spect$ttt
+```
+
+### Antiaggrégants
+```{r}
+pattern_AAP <- "aspirine|kardegic|K160|K75|duoplavin|plavix|aspegic|AAP|clopidogrel|acetylsali|brilique|ticagrelor|resitune"
+spect$aap <- ifelse(
+  spect$ttt %like% pattern_AAP == TRUE,"AAP","No_AAP"
+  )
+spect$aap <- ordered(spect$aap, levels = c("No_AAP", "AAP"))
+```
+
+### Anticoagulants
+```{r}
+pattern_Antico <- "coumadine|eliquis|naco|xarelto|previscan|sintro|warfarin|avk|pradaxa|dabigatran|xaban|parine"
+spect$antico <- ifelse(
+  spect$ttt %like% pattern_Antico == TRUE,"Antico","No_Antico"
+  )
+spect$antico <- ordered(spect$antico, levels = c("No_Antico", "Antico"))
+```
+
+### Bétabloquants
+```{r}
+pattern_BB <- "olol|tenormine|cardentiel|cardensiel|kredex|temerit|bisoce|seloken|lodoz|detensiel|sectral|corgard|kerlone|betablo|nebilox|sotalol|sotalex|tenoretic"
+spect$bb <- ifelse(
+  spect$ttt %like% pattern_BB == TRUE,"BB","No_BB"
+  )
+spect$bb <- ordered(spect$bb, levels = c("No_BB", "BB"))
+```
+
+### Ivabradine
+```{r}
+pattern_ivabradine <- "ivabradine|procoralan"
+spect$ivabradine <- ifelse(
+  spect$ttt %like% pattern_ivabradine == TRUE,"ivabradine","No_ivabradine"
+  )
+spect$ivabradine <- ordered(spect$ivabradine, levels = c("No_ivabradine", "ivabradine"))
+```
+
+### Statines
+```{r}
+pattern_statine <- "statine|tahor|crestor|zocor|lodales|inegy"
+spect$statine <- ifelse(
+  spect$ttt %like% pattern_statine == TRUE,"statine","No_statine"
+  )
+spect$statine <- ordered(spect$statine, levels = c("No_statine", "statine"))
+```
+
+### Autres hypolipémiants
+```{r}
+pattern_hypolipemiant <- "ezetrol|liptruzet|ezetimib|inegy|lipanthyl|fibrate"
+spect$autre_hypolipemiant <- ifelse(
+  spect$ttt %like% pattern_hypolipemiant == TRUE,"hypolipemiant","No_hypolipemiant"
+  )
+spect$autre_hypolipemiant <- ordered(spect$autre_hypolipemiant, levels = c("No_hypolipemiant", "hypolipemiant"))
+```
+
+### Anti-aldo, ARA2 et IEC
+```{r}
+pattern_IEC <- "sacubitril|entresto|sartan|pril|micardis|dactone|spirono|eplerenone|rasilez|aliskiren|aprovel|triatec|coversyl|tareg|coveram|coaprovel|fortzaar|exforge|preterax|zanextra|zestril|araii|ara2|kenzen"
+spect$iec <- ifelse(
+  spect$ttt %like% pattern_IEC == TRUE,"ACEI","No_IEC"
+  )
+spect$iec <- ordered(spect$iec, levels = c("No_IEC", "ACEI"))
+```
+
+### Diuretiques
+```{r}
+pattern_diuretiques <- "diuretique|lasilix|esidrex|coaprovel|hyperium|furosemide|indapamide|hydrochlorot|cotriatec|bipreterax|temeritduo|hcz|hctz|tenoretic|cotareg"
+spect$diuretiques <- ifelse(
+  spect$ttt %like% pattern_diuretiques == TRUE,"diuretics","No_diuretic"
+  )
+spect$diuretiques <- ordered(spect$diuretiques, levels = c("No_diuretic", "diuretics"))
+```
+
+### Anticalciques
+```{r}
+pattern_ICa <- "loxen|zanidip|lercan|amlor|dipine|coveram|exforge|verapamil|isoptine|zanextra|iperten|tildiem"
+spect$ica <- ifelse(
+  spect$ttt %like% pattern_ICa == TRUE,"Ca-blockers","No_Ca-blockers"
+  )
+spect$ica <- ordered(spect$ica, levels = c("No_Ca-blockers", "Ca-blockers"))
+```
+
+### Insuline
+Pour l'insuline et pour les ADO, on considère que les si les patients ont ce type de traitement, alors, ils sont diabétiques.
+```{r}
+spect$ttt <- gsub(pattern = "noninsulinor", replacement = "", x = spect$ttt)
+pattern_insuline <- "insuline|lantus|novorapid|humalog|insulinor"
+spect$insuline <- ifelse(
+  spect$ttt %like% pattern_insuline == TRUE,"insuline","No_insuline"
+  )
+spect$insuline <- ordered(spect$insuline, levels = c("No_insuline", "insuline"))
+spect$diabetes <- ifelse(
+  spect$insuline == "insuline", "Diabetes", as.character(spect$diabetes)
+  )
+```
+
+### ADO
+```{r}
+pattern_ADO <- "metformine|diamicron|glucophage|xelevia|gliptine|gliclazide|stagid|januvia|gavus"
+spect$ado <- ifelse(
+  spect$ttt %like% pattern_ADO == TRUE,"OAD","No_OAD"
+  )
+spect$ado <- ordered(spect$ado, levels = c("No_OAD", "OAD"))
+spect$diabetes <- ifelse(
+  spect$ado == "OAD", "Diabetes", as.character(spect$diabetes)
+  )
+spect$diabetes <- ordered(spect$diabetes, levels = c("No_Diabetes", "Diabetes"))
+
+```
+
+### Nettoyage
+```{r, message=FALSE, warning=FALSE, results='hide'}
+rm(list = apropos("pattern"))
+spect <- spect %>%
+  select(-c(ttt))
+```
+
+## Signes fonctionnels, caractérisation de la douleur
+
+### Douleur thoracique
+```{r}
+gsub(pattern = " DT", replacement = " douleur thoracique", x = spect$spectdata) %>% 
+  ToutEnMinuscule() %>% 
+  Unaccent() %>% 
+  {gsub(pattern = "precordialgie", replacement = "douleurthoracique", x = .)} %>%
+  #on doit mettre le critère repos/effort après le caractère constrictive sinon, cela ne sera pas trouvé
+  {gsub(pattern = "reposconstrictive", replacement = "constrictivederepos", x = .)} %>% 
+  {gsub(pattern = "effortconstrictive", replacement = "oppressionthoraciquealeffort", x = .)} ->
+  spect$search_sf
+```
+
+On cherche en premier les "pas de douleur thoracique" ou "asymptomatique"
+```{r}
+pattern <- "pasdedouleurthoracique|pasdedouleursthoracique|asymptomatique|pasdangor|absencededouleurtho|pasdesymptomatologieang|pasdedt"
+spect$dt <- ifelse(spect$search_sf %like% pattern == TRUE,"aucune","inconnu")
+```
+
+Ensuite on va chercher les douleurs thoraciques, les douleurs précordiales sachant que parfois il existe un ou plusieurs petits mots entre douleur et thoracique, il y a aussi la problématique des pluriels, parfois douleurs est au pluriel, parfois c'est thoracique, parfois c'est les deux et parfois tout est au singulier. On enlève donc tous les S, et on cherche si on a "thora" (permet d'avoit thoracique et thorax) ou "cordial" (permet d'avoir précordial et precordial avec ou sans e). On coupe après acquisition, sinon l'évocation d'appeler le SAMU en cas de douleurs dans les résultats est suffisant pour faire dire qu'il y a une DT, même s'il n'y en a pas.
+```{r}
+str_remove_all(spect$search_sf, "s") %>% 
+  {gsub("acquiition.*", "", .)} ->
+  spect$search_sf  
+  
+pattern <- "ymptomatologieangoreue|ymptomatologieangineue|oppreionthoracique|oppreionretroternale|genethoracique|angordeffort|angordepui|dtcontrict|dtprolong|douleurthoracique|douleurtypiq|douleuratypiqu"
+spect$dt <- ifelse(
+  spect$dt=="inconnu",ifelse(
+    spect$search_sf %like% pattern == TRUE,"oui","inconnu"
+    ),
+  as.character(spect$dt)
+  )
+```
+
+Ensuite, on prend les 25 caractères qui suivent "douleur" et on va chercher des racines de mots évocatrices d'une douleur thoracique
+```{r}
+pattern <- "thora|troternal|cordial|later"
+gsub(".*douleur", "", spect$search_sf) %>% 
+  {str_sub(.,1,25)} %>% 
+  {ifelse(spect$dt=="inconnu",ifelse(. %like% pattern == TRUE,"oui","inconnu"),as.character(spect$dt))} ->
+  spect$dt
+spect$dt <- ordered(spect$dt, levels = c("oui", "aucune", "inconnu"))
+```
+
+On cherche ensuite un lien avec l'effort. On prend les caractères qui suivent douleur parce que la description du lien avec l'effort est souvent un peu plus loin que 25 caractères. Le problème, c'est qu'on va couper la chaine à "douleur" et qu'il va prendre la dernière occurence et qu'on va perdre de l'info notamment sur le caractère lié à l'effort. L'astuce consiste à remplacer le terme équivalent à douleur par douleurs avec un s. On cherche ensuite à couper ce terme avec un s (on le trouvera facilement car les s ont été supprimés). On remplace par le terme angor, ce qui permettra plus tard de statuer sur la caractère typique ou non. On considère en effet que angor = typique, donc il faut en garder une trace.
+```{r}
+pattern_constrictif <- "ymptomatologieangoreue|ymptomatologieangineue|oppreionthoracique|oppreionretroternale|angor|dtcontrict|contrictive|dtprolong|douleurthoraciquecontrict|douleurthoraciqueprolong|irradiantalamachoire"
+pattern_douleur_non_constrictif <- "genethoracique"
+gsub(pattern = pattern_constrictif, replacement = "douleursangor", x = spect$search_sf) %>%
+  {gsub(pattern = pattern_douleur_non_constrictif, replacement = "douleurs", x = .)} ->
+  spect$search_sf
+```  
+
+On supprime le terme d'épreuve d'effort pour ne pas classifier le caractère "à l'effort" d'une douleur sur ce terme. Ensuite, comme expliqué au-dessus, on coupe à "douleurs" sinon "douleur'.
+```{r}
+pattern_epreuve_effort <- "epreuvedeffort|testdeffort"
+spect$search_sf <- gsub(pattern = pattern_epreuve_effort, replacement = "", x = spect$search_sf)
+
+pattern <- "douleurs"
+spect$search_sf <- ifelse(
+  spect$search_sf %like% pattern == TRUE, gsub(".*douleurs", "", spect$search_sf), gsub(".*douleur", "", spect$search_sf)
+  )
+```
+
+Le caractère lié à l'effort ne vaut que s'il y a douleur, donc il faut qu'il existe une douleur pour ensuite se poser la question si elle est liée ou non à l'effort. Souvent, il est écrit une dyspnée d'effort, ce qui ne nous intéresse pas ici car cela sera extrait dans la classe NYHA. On supprime tout ce qui suit le terme "dyspnée" et après "acquisition".
+```{r}
+gsub("dypnee.*", "", spect$search_sf) %>% 
+{gsub("acquiition.*", "", .)} ->
+spect$search_sf
+```  
+
+On commence par les patterns qui éliminent le lien à l'effort, plus longues. Puis, on cherche le caractère lié à l'effort de la douleur. Si les patterns sont étranges, c'est parce que les "s" ont été supprimés. Les patients qui restent n'ont pas de douleurs d'effort.
+```{r}
+pattern <- "anlienavecleffort|anrapportavecleffort|anrapportavecleeffort|nonlieealeffort|nonlieeauxeffort|derepo|aurepo|nonrythmeeparleffort|anlienavecleeffort|anrapportavecleeffort|nonrythmeeparleeffort"
+spect$effort <- ifelse(
+  spect$dt=="oui", ifelse(
+    spect$search_sf %like% pattern == TRUE, "non", "inconnu"
+    ),
+  "pas de DT"
+  )
+
+pattern <- "lamarche|effort"
+spect$effort <- ifelse(
+  spect$dt=="oui", ifelse(
+    spect$effort=="inconnu", ifelse(
+      spect$search_sf %like% pattern == TRUE, "oui", "inconnu"
+      ),
+    spect$effort
+    ),
+  "pas de DT"
+  )
+
+spect$effort <- ifelse(
+  spect$dt=="oui", ifelse(
+    spect$effort=="inconnu", "non précisé", spect$effort
+    ),
+  "pas de DT"
+  )
+
+spect$effort <- ordered(spect$effort, levels = c("oui", "non", "non précisé", "pas de DT"))
+
+```
+
+On recherche le type "constrictif" de la symptomatologie. On reprend le concept du lien avec les douleurs, on va chercher que ce qu'il y a entre douleur et dyspnée. On regarde s'il y a le mot atypique, sinon typique ou des caractéristiques en faveur. S'il y a le mot atypique, il faut le repérer puis le supprimer pour ne pas tagguer typique.
+```{r}
+pattern_atypique <- "atypique"
+spect$typique <- ifelse(
+  spect$dt=="oui", ifelse(
+    spect$search_sf %like% pattern_atypique == TRUE, "atypique", "inconnu"
+    ),
+  "pas de DT"
+  )
+
+spect$search_sf <- gsub(pattern = pattern_atypique, replacement = "", x = spect$search_sf)
+
+pattern_typique <- "typique|contrictive|angor|serrement|efforttrinit"
+spect$typique <- ifelse(
+  spect$dt=="oui", ifelse(
+    spect$typique=="inconnu", ifelse(
+      spect$search_sf %like% pattern_typique == TRUE, "typique", "non précisé"
+      ),
+    spect$typique
+    ),
+  "pas de DT"
+  )
+
+spect$typique <- ordered(spect$typique, levels = c("typique", "atypique", "non précisé", "pas de DT"))
+
+```                                             
+
+### Dyspnée
+Pour différencier les NYHA I-II des NYHA III, il faut que l'on garde une trace du tiret sinon ça fera nyhaiii dans les deux cas. Les tirets et les "à" sont remplacés par des "z", qu'on pourra retrouver facilement.
+```{r}
+gsub(pattern = "-", replacement = "z", x = spect$search) %>% 
+  ToutEnMinuscule() %>% 
+  {gsub(pattern = "à", replacement = "z", x = .)} %>% 
+  Unaccent() ->
+  spect$search_sf
+  
+pattern_dyspnee = "dyspneedestade|dyspneestade"
+spect$search_sf <- gsub(pattern = pattern_dyspnee, replacement = "dyspneenyha", x = spect$search_sf)
+```
+
+On cherche en premier les "pas de dyspnée ou aucune dyspnée" puis ensuite on coupe la chaîne à nyha puis on cherche les patterns qui décrivent la classe NYHA. On part de la chaîne la plus longue à la plus courte.
+```{r}
+pattern_dyspnee <- "pasdedyspnee|aucunedyspnee|sansdyspnee|nidedyspnee"
+spect$dyspnee <- ifelse(spect$search_sf %like% pattern_dyspnee == TRUE,"aucune","inconnu")
+spect$search_sf <- str_remove(spect$search_sf, "pasdedyspnee")
+spect$search_sf <- str_remove(spect$search_sf, "aucunedyspnee")
+spect$search_sf <- str_remove(spect$search_sf, "sansdyspnee")
+spect$search_sf <- str_remove(spect$search_sf, "nidedyspnee")
+
+spect$search_sf <- gsub(".*nyha", "", spect$search_sf)
+
+temp_nyha6 <- as.character(str_sub(spect$search_sf, 1, 6))
+temp_nyha5 <- as.character(str_sub(spect$search_sf, 1, 5))
+temp_nyha4 <- as.character(str_sub(spect$search_sf, 1, 4))
+temp_nyha3 <- as.character(str_sub(spect$search_sf, 1, 3))
+temp_nyha2 <- as.character(str_sub(spect$search_sf, 1, 2))
+temp_nyha1 <- as.character(str_sub(spect$search_sf, 1, 1))
+
+temp_dyspnee <- case_when(
+  temp_nyha6 == "iiziii" ~ "NYHA II-III",
+  temp_nyha6 == "iiiziv" ~ "NYHA III-IV",
+  temp_nyha5 == "iiiii" ~ "NYHA II-III",
+  temp_nyha5 == "iiiiv" ~ "NYHA III-IV",
+  temp_nyha4 == "izii" ~ "NYHA I-II",
+  temp_nyha3 == "iii" ~ "NYHA III",
+  temp_nyha3 == "1z2" ~ "NYHA I-II",
+  temp_nyha3 == "2z3" ~ "NYHA II-III",
+  temp_nyha3 == "3z4" ~ "NYHA III-IV",
+  temp_nyha2 == "12" ~ "NYHA I-II",
+  temp_nyha2 == "23" ~ "NYHA II-III",
+  temp_nyha2 == "34" ~ "NYHA III-IV",
+  temp_nyha2 == "ii" ~ "NYHA II",
+  temp_nyha2 == "iv" ~ "NYHA IV",
+  temp_nyha1 == "1" ~ "NYHA I",
+  temp_nyha1 == "2" ~ "NYHA II",
+  temp_nyha1 == "3" ~ "NYHA III",
+  temp_nyha1 == "4" ~ "NYHA IV",
+  temp_nyha1 == "i" ~ "NYHA I",
+  TRUE ~ "inconnu"
+)   
+
+spect$dyspnee <- ifelse(
+  spect$dyspnee=="inconnu", ifelse(
+    temp_dyspnee!="inconnu", temp_dyspnee, "inconnu"
+    ),
+  spect$dyspnee
+  )
+```
+
+Pour finir avec la dyspnée, parfois il n'est pas écrit NYHA, simplement dyspnée à la marche ou à l'effort. On va regarder dans les 25 caractères qui suivent
+```{r}
+gsub(".*dyspnee", "", spect$search_sf) %>% 
+  {str_sub(.,1,25)} ->
+  spect$search_sf
+
+pattern_dyspnee_marche <- "zlamarche"
+spect$dyspnee <- ifelse(
+  spect$dyspnee=="inconnu", ifelse(
+    spect$search_sf %like% pattern_dyspnee_marche == TRUE, "à la marche", "inconnu"
+    ),
+  spect$dyspnee
+  )
+
+pattern_dyspnee_oui <- "associee|effort"
+spect$dyspnee <- ifelse(
+  spect$dyspnee=="inconnu", ifelse(
+    spect$search_sf %like% pattern_dyspnee_oui == TRUE, "oui", "inconnu"
+    ),
+  spect$dyspnee
+  )
+
+spect$dyspnee <- ifelse(spect$dyspnee=="inconnu", "aucune", spect$dyspnee)
+```
+
+### Nettoyage
+```{r, message=FALSE, warning=FALSE, results='hide'}
+rm(list = apropos("pattern"))
+rm(list = apropos("temp"))
+spect <- spect %>%
+  select(-c(search_sf))
+```
+
+## Type de stress
+
+On commence par dire que toutes les dynamiques sont faites au regadenoson, puis on cherche dans l'ordre les indices cochés (x) puis les autres (il faut respecter cet ordre sinon c'est le bordel). De cette façon, il n'y a plus de "rest only", juste quelques "inconnus" liés à des fautes de frappes. Enfin, il faut remplacer "wmax" par autre chose qui se termine pas par "x"
+```{r}
+pattern <- "Coeur DYN"
+spect$type_stress <- ifelse(
+  spect$protocole %like% pattern == TRUE,"Regadenoson 1","inconnu"
+  )
+
+ToutEnMinuscule(spect$search) %>% 
+  Unaccent() %>% 
+  {gsub(pattern = "wmax", replacement = "watt", x = .)} ->
+  spect$temp_ee
+
+temp_ee2 <- case_when(
+  spect$temp_ee %like% "xtestmixte" ~ "Combined",
+  spect$temp_ee %like% "xpersantine" ~ "Dipyridamole",
+  spect$temp_ee %like% "xregadenoson" ~ "Regadenoson",
+  spect$temp_ee %like% "xeffort" ~ "Exercise",
+  spect$temp_ee %like% "epreuvedestresstestmixteassociantpersantine056mgkgetepreuvedeffortsurbicycletterealiseepar" ~ "Combined",
+  spect$temp_ee %like% "epreuvedestresspersantinerealiseepar" ~ "Dipyridamole",
+  spect$temp_ee %like% "epreuvedestresspersantine056mgkgrealiseepar" ~ "Dipyridamole",
+  spect$temp_ee %like% "epreuvedestressregadenosonrealiseepar" ~ "Regadenoson",
+  spect$temp_ee %like% "epreuvedeffortsurbicycletteexplorant" ~ "Exercise",
+  spect$temp_ee %like% "epreuvedestresstestmixteassociantpersantine056mgkgetepreuvedeffortsurbicyclette" ~ "Combined",
+    TRUE ~ "inconnu"
+)   
+
+spect$type_stress <- ifelse(
+  spect$type_stress=="inconnu",ifelse(
+    temp_ee2 != "inconnu", temp_ee2,"inconnu"
+    ),
+  spect$type_stress
+  )
+
+spect$type_stress <- ordered(spect$type_stress, levels = c("Exercise", "Dipyridamole", "Regadenoson", "Combined", "inconnu"))
+
+```
+
+### Nettoyage
+```{r, message=FALSE, warning=FALSE, results='hide'}
+rm(list = apropos("pattern"))
+rm(list = apropos("temp"))
+spect <- spect %>%
+  select(-c(temp_ee))
+```
+
+## Volumes et fonction VG
+
+### FEVG de stress
+Il faut enlever tout ce qu'il y a avant 99mtc car sinon, on travaille sur la technique et non sur les résultats. Il faut garder uniquement ce qu'il y a entre "acquisition de stress" et "acquisition de repos". Il peut arriver que les patients n'aient pas eu de repos, dans ce cas, on va jusqu'à la fin.
+```{r, message=FALSE, warning=FALSE, results='hide'}
+ToutEnMinuscule(spect$search) %>% 
+  Unaccent() %>% 
+  {gsub(".*99mtc", "", .)} ->
+  spect$vg_stress
+
+start_cut <- as.data.table(str_locate(spect$vg_stress, "acquisitiondestress")) 
+end_cut <- as.data.table(str_locate(spect$vg_stress, "acquisitionderepos")) 
+spect$vg_stress_temp <- str_sub(spect$vg_stress, start_cut$start, end_cut$end) 
+
+spect$vg_stress <- ifelse(
+  is.na(spect$vg_stress_temp),str_sub(spect$vg_stress, start_cut$start),spect$vg_stress_temp
+  )
+
+# On attaque pour la FEVG de stress 
+FEVG <- as.data.table(str_locate(spect$vg_stress, "fevg")) 
+spect$fevg_stress <- str_sub(spect$vg_stress,FEVG$end) 
+
+# On vire progressivement les scories qu'on remplace par un "." car il y en a déjà beaucoup
+spect$fevg_stress <- gsub(pattern = "gdestress:", replacement = ".", x = spect$fevg_stress) 
+spect$fevg_stress <- gsub(pattern = "g:", replacement = ".", x = spect$fevg_stress) 
+spect$fevg_stress <- gsub(pattern = ".>", replacement = ".", x = spect$fevg_stress) 
+
+# On cherche le tag "." et on se met de côté la localisation du "." 
+tag_EFstr <- as.data.table(str_locate(spect$fevg_stress, ".")) 
+
+# Ensuite on va chercher les deux caractères qui sont après et on le sauvegarde dans le champ FEVG_stress 
+spect$fevg_stress <- as.numeric(as.character(
+  str_sub(spect$fevg_stress, tag_EFstr$start+1, tag_EFstr$start+2))
+  ) 
+```
+
+### VTD stress
+```{r, message=FALSE, warning=FALSE, results='hide'}
+VTD <- as.data.table(str_locate(spect$vg_stress, "vtd")) 
+spect$vtd_stress <- str_sub(spect$vg_stress,VTD$end) 
+
+# on cherche le tag "d=" et on se met de côté sa localisation puis on récupère les chiffres
+tag_VTDstr <- as.data.table(str_locate(spect$vtd_stress, "d")) 
+spect$vtd_stress <- ifelse(
+  str_sub(spect$vtd_stress, tag_VTDstr$end+4, tag_VTDstr$end+4)=="m",
+  as.numeric(as.character(str_sub(spect$vtd_stress, tag_VTDstr$end+1, tag_VTDstr$end+3))),
+  as.numeric(as.character(str_sub(spect$vtd_stress, tag_VTDstr$end+1, tag_VTDstr$end+2)))
+  )
+```
+
+### VTS stress
+```{r, message=FALSE, warning=FALSE, results='hide'}
+VTS <- as.data.table(str_locate(spect$vg_stress, "vts")) 
+spect$vts_stress <- str_sub(spect$vg_stress,VTS$end) 
+
+# on cherche le tag "s=" et on se met de côté sa localisation puis on récupère les chiffres
+tag_VTSstr <- as.data.table(str_locate(spect$vts_stress, "s")) 
+spect$vts_stress <- ifelse(
+  str_sub(spect$vts_stress, tag_VTSstr$end+3, tag_VTSstr$end+3)=="m",
+  as.numeric(as.character(str_sub(spect$vts_stress, tag_VTSstr$end+1, tag_VTSstr$end+2))),
+    ifelse(str_sub(spect$vts_stress, tag_VTSstr$end+4, tag_VTSstr$end+4)=="m",
+           as.numeric(as.character(str_sub(spect$vts_stress, tag_VTSstr$end+1, tag_VTSstr$end+3))),
+           as.numeric(as.character(str_sub(spect$vts_stress, tag_VTSstr$end+1, tag_VTSstr$end+1)))
+    )
+  )
+```
+
+### FEVG de repos
+Il faut enlever tout ce qu'il y a avant 99mtc car sinon, on travaille sur la technique et non sur les résultats. Puis, enlever ce qu'il y a avant "FEVG de repos".
+```{r, message=FALSE, warning=FALSE, results='hide'}
+ToutEnMinuscule(spect$search) %>% 
+  Unaccent() %>% 
+  {gsub(pattern = "fevgderepos", replacement = "fevgaurepos", x = .)} ->
+  spect$vg_repos
+
+FEVG_repos <- as.data.table(str_locate(spect$vg_repos, "fevgaurepos")) 
+spect$vg_repos <- str_sub(spect$vg_repos,FEVG_repos$end) 
+
+# le tag était pour le stress un ".". je le remplace par un "s" de "....fevgderepos"
+# on vire progressivement les scories qu'on remplace par un "s"
+spect$vg_repos <- gsub(pattern = "s:", replacement = "s", x = spect$vg_repos)
+spect$vg_repos <- gsub(pattern = ">", replacement = "s", x = spect$vg_repos) 
+
+# on cherche le tag "s" et on se met de côté la localisation du "s" 
+tag_EFrest <- as.data.table(str_locate(spect$vg_repos, "s")) 
+
+# ensuite on va chercher les deux caractères qui sont après et on le sauvegarde dans le champ FEVG_stress 
+spect$fevg_repos <- as.numeric(as.character(
+  str_sub(spect$vg_repos, tag_EFrest$start+1, tag_EFrest$start+2))
+  ) 
+```
+
+### VTD repos
+```{r, message=FALSE, warning=FALSE, results='hide'}
+VTDr <- as.data.table(str_locate(spect$vg_repos, "vtd")) 
+spect$vtd_repos <- str_sub(spect$vg_repos,VTDr$end) 
+
+# on cherche le tag "d=" et on se met de côté sa localisation puis on récupère les chiffres
+tag_VTDrep <- as.data.table(str_locate(spect$vtd_repos, "d")) 
+spect$vtd_repos <- ifelse(
+  str_sub(spect$vtd_repos, tag_VTDrep$end+4, tag_VTDrep$end+4)=="m",
+  as.numeric(as.character(str_sub(spect$vtd_repos, tag_VTDrep$end+1, tag_VTDrep$end+3))),
+  as.numeric(as.character(str_sub(spect$vtd_repos, tag_VTDrep$end+1, tag_VTDrep$end+2)))
+  )
+```
+
+### VTS repos
+```{r, message=FALSE, warning=FALSE, results='hide'}
+VTSr <- as.data.table(str_locate(spect$vg_repos, "vts")) 
+spect$vts_repos <- str_sub(spect$vg_repos,VTSr$end) 
+
+# on cherche le tag "s=" et on se met de côté sa localisation puis on récupère les chiffres
+tag_VTSrep <- as.data.table(str_locate(spect$vts_repos, "s")) 
+spect$vts_repos <- ifelse(
+  str_sub(spect$vts_repos, tag_VTSrep$end+3, tag_VTSrep$end+3)=="m",
+  as.numeric(as.character(str_sub(spect$vts_repos, tag_VTSrep$end+1, tag_VTSrep$end+2))),ifelse(
+    str_sub(spect$vts_repos, tag_VTSrep$end+4, tag_VTSrep$end+4)=="m",                                        as.numeric(as.character(str_sub(spect$vts_repos, tag_VTSrep$end+1, tag_VTSrep$end+3))),
+    as.numeric(as.character(str_sub(spect$vts_repos, tag_VTSrep$end+1, tag_VTSrep$end+1))))
+  )
+```
+
+### Nettoyage
+```{r, message=FALSE, warning=FALSE, results='hide'}
+rm(end_cut, FEVG, FEVG_repos, start_cut, VTD, VTDr, VTS, VTSr)
+rm(list = apropos("tag_"))
+spect <- spect %>%
+  select(-c(vg_stress, vg_stress_temp, vg_repos))
+```
+
+## Perfusion
+On recréé un champ de recherche en enlevant tout ce qu'il y a avant "tomo", ainsi on a bien les résultats. Parfois le terme tomo n'est pas présent, dans ce cas on coupe à acquisition, en 2e intention.
+```{r}
+ToutEnMinuscule(spect$search) %>% 
+  Unaccent() %>% 
+  {gsub(".*acquisition", "", .)} %>% 
+  {gsub(".*tomo", "", .)} ->
+  spect$conclusion
+```
+
+### Indication à une coronarographie
+```{r}
+pattern <- "coronarographie"
+spect$sent_to_angio <- ifelse(spect$conclusion %like% pattern == TRUE,"sent-to-angiography","no")
+```
+
+### Perfusion normale
+```{r}
+pattern <- "scintigraphiedeperfusionnormale|scintigraphiemyocardiquenormale|scintigraphiedynamiquenormale|scintigraphiemyocardiquedynamiqueetstatiquenormale|scintigraphiemyocardiquedynamiquenormale|scintigraphiemyocardiquedeperfusionnormale"
+spect$spect_perfusion <- ifelse(
+  spect$conclusion %like% pattern == TRUE,"Normal perfusion","inconnu"
+  )
+pattern <- "attenuation"
+spect$spect_perfusion <- ifelse(
+  spect$spect_perfusion == "inconnu",ifelse(
+    spect$conclusion %like% pattern == TRUE,"Attenuation artefact","Abnormal perf"
+    ),
+  spect$spect_perfusion
+  )
+```
+
+```{r, echo=FALSE}
+# on arrete de s'emmerder avec les attenuations
+# @Alain: J'annote cette ligne pour l'instant car aucune différence avec le champ du dessus. A voir.
+#spect$spect_results <- ifelse(spect$spect_perfusion == "Abnormal perf", "Abnormal perfusion", "Normal perfusion")
+
+# @Alain: pareil pour la perfusion des CMD
+#pattern <- "cmd"
+#spect$SPECT_perfusion <- ifelse(spect$conclusion %like% pattern == TRUE,"CMD","inconnu")
+```
+
+### Perfusion anormale (ischémie myocardique)
+On va chercher "ischemie myocardique", on coupe et on garde les 50 caractères qui suivent. Mais parfois il y a deux fois le terme ischémie et si on coupe au 2e, on perd de l'information, il faut donc couper au premier, ce qui n'est pas possible avec la syntaxe que l'on utilise. On va donc ruser en utilisant "sub" au lieu de "gsub" qui va remplacer la premiere occurence d'ischémie en ischemia puis on coupe à ischemia. C'est vraiment pas élégant mais je ne vois pas de façon plus simple d'arriver au résultat recherché
+```{r}
+spect$temp_perfusion <- sub("ischemie", "ischemia", spect$conclusion)
+pattern <- "sansischemia"
+spect$temp_perfusion2 <- ifelse(
+  spect$temp_perfusion %like% pattern == TRUE, "non", "a definir"
+  )
+spect$temp_perfusion <- sub(".*ischemia", "", spect$temp_perfusion)
+spect$temp_perfusion <- str_sub(spect$temp_perfusion,1,50)
+```
+
+On commence à quantifier les défects prfusionnels. On commence par remplacer les coquetteries du style "sur 1 segment" ou "d'1 segment" au lieu de "de 1 segment". Puis on quantifie l'étendue de l'ischémie en fonction des caractères qui précèdent le mot "segment". Si NA, on met 0, il n'y a pas d'ischémie. On finit aussi par définir ce qu'est une ischémie étendue.
+```{r}
+nb_segment <- as.data.frame(str_locate(spect$temp_perfusion, "segment"))
+spect$nb_segment_isch <- ifelse(
+  spect$temp_perfusion2 == "a definir",
+  str_sub(spect$temp_perfusion, nb_segment$start-7, nb_segment$start-1), 0
+  )
+spect$nb_segment_isch2 <- ifelse(
+  spect$temp_perfusion2 == "a definir",
+  str_sub(spect$temp_perfusion, nb_segment$start-3, nb_segment$start-1), 0
+  )
+spect$nb_segment_isch3 <- ifelse(
+  spect$temp_perfusion2 == "a definir",
+  str_sub(spect$temp_perfusion, nb_segment$start-2, nb_segment$start-1), 0
+  )
+spect$nb_segment_isch4 <- ifelse(
+  spect$temp_perfusion2 == "a definir",
+  str_sub(spect$temp_perfusion, nb_segment$start-1, nb_segment$start-1), 0
+  )
+
+ischemie <- case_when(
+  spect$nb_segment_isch == "oinsde1" ~ "0.5",
+  spect$nb_segment_isch == "moinsd1" ~ "0.5",
+  spect$nb_segment_isch == "oinsde2" ~ "1.5",
+  spect$nb_segment_isch == "oinsde3" ~ "2.5",
+  spect$nb_segment_isch == "oinsde4" ~ "3.5",
+  spect$nb_segment_isch == "oinsde5" ~ "4.5",
+  spect$nb_segment_isch == "oinsde6" ~ "5.5",
+  spect$nb_segment_isch == "oinsde7" ~ "6.5",
+  spect$nb_segment_isch == "oinsde8" ~ "7.5",
+  spect$nb_segment_isch2 == "1a2" ~ "1.5",
+  spect$nb_segment_isch2 == "2a3" ~ "2.5",
+  spect$nb_segment_isch2 == "3a4" ~ "3.5",
+  spect$nb_segment_isch2 == "4a5" ~ "4.5",
+  spect$nb_segment_isch2 == "5a6" ~ "5.5",
+  spect$nb_segment_isch2 == "6a7" ~ "6.5",
+  spect$nb_segment_isch2 == "7a8" ~ "7.5",
+  spect$nb_segment_isch2 == "8a9" ~ "8.5",
+  spect$nb_segment_isch3 == "12" ~ "1.5",
+  spect$nb_segment_isch3 == "23" ~ "2.5",
+  spect$nb_segment_isch3 == "34" ~ "3.5",
+  spect$nb_segment_isch3 == "45" ~ "4.5",
+  spect$nb_segment_isch3 == "56" ~ "5.5",
+  spect$nb_segment_isch3 == "67" ~ "6.5",
+  spect$nb_segment_isch3 == "78" ~ "7.5",
+  spect$nb_segment_isch3 == "89" ~ "8.5",
+  spect$nb_segment_isch4 == "1" ~ "1",
+  spect$nb_segment_isch4 == "2" ~ "2",
+  spect$nb_segment_isch4 == "3" ~ "3",
+  spect$nb_segment_isch4 == "4" ~ "4",
+  spect$nb_segment_isch4 == "5" ~ "5",
+  spect$nb_segment_isch4 == "6" ~ "6",
+  spect$nb_segment_isch4 == "7" ~ "7",
+  spect$nb_segment_isch4 == "8" ~ "8",
+  spect$nb_segment_isch4 == "9" ~ "9"
+)
+spect$nb_segment_isch <- as.numeric(as.character(ischemie))
+spect$nb_segment_isch[is.na(spect$nb_segment_isch)] <- 0
+
+spect$signif_ischemia <- ifelse(
+  spect$nb_segment_isch == 0, "pas d'ischémie", ifelse(
+    spect$nb_segment_isch >1.5, "ischémie >= 2 segments", "ischémie <2 segments"
+    )
+  )
+```
+
+### Perfusion anormale (infarctus)
+On va chercher "infarctus", on coupe et on garde les 20 caractères qui suivent.
+```{r, message=FALSE, warning=FALSE, results='hide'}
+gsub(pattern = "necrosemyocardique", replacement = "infarctus", x = spect$conclusion) %>% 
+  {gsub(".*infarctus", "", .)} %>% 
+  {str_sub(.,1,30)} %>% 
+  {gsub(pattern = "d1", replacement = "01", x = .)} %>% 
+  # au cas où on a un truc du genre 2/17 segments
+  {gsub(pattern = "17", replacement = "segment", x = .)}->
+  temp_infarctus
+  
+nb_segment <- as.data.table(str_locate(temp_infarctus, "segment"))
+
+as.numeric(as.character(str_sub(temp_infarctus, nb_segment$start-1, nb_segment$start-1))) %>% 
+  {ifelse(.==0,10,.)} %>% 
+  {ifelse(is.na(.), 0, .)} ->
+  spect$nb_segment_IDM
+```
+
+### Nettoyage
+```{r, message=FALSE, warning=FALSE, results='hide'}
+rm(ischemie, pattern, temp_infarctus, nb_segment)
+spect <- spect %>%
+  select(-c(protocole, search, conclusion, temp_perfusion, temp_perfusion2, nb_segment_isch2, nb_segment_isch3, nb_segment_isch4))
+```
+
+# Probabilité pré-test
+On cherche à multiplier entre eux les 3 paramètres : sexe, age et symptomatologie. Dès lors que chaque paramètre est associé à un nombre premier, le produit des 3 permettra d'identifier dans quelle case des recos on se trouve et donc d'aller chercher la proba pré-test associée. Les coronariens déja connus sont exclus (le produit fait 0).
+```{r}
+proba_temp <- ifelse(spect$indication_exam=="Suivi de CMI",0,1)
+proba_temp <- ifelse(proba_temp != 0, ifelse(spect$gender=="M",1,ifelse(spect$gender=="F",2,0)), 0)
+
+age_par_dizaine <- floor((spect$age)*(0.1))
+
+proba_temp2 <- ifelse(
+  age_par_dizaine==3, 3, ifelse(age_par_dizaine==4,5,ifelse(
+    age_par_dizaine==5, 7, ifelse(
+      age_par_dizaine==6, 11, ifelse(
+        age_par_dizaine>6, 13, 0)
+        )
+      )
+    )
+  )
+
+proba_temp3 <- ifelse(
+  spect$typique=="typique", 17, ifelse(
+    spect$typique=="atypique", 19, 23))
+# Si pas de douleur thoracique mais dyspnée, alors on attribue le chiffre premier 29
+# @Alain, les NYHA I sont considérés comme dyspnéique... souvent on considère les SF à NYHA II+
+proba_temp3 <- ifelse(
+  proba_temp3==23, ifelse(
+    spect$dyspnee!="aucune", 29, 23
+    ),
+  proba_temp3
+  )
+
+proba_overall <- proba_temp * proba_temp2 * proba_temp3
+
+spect$proba <- case_when(
+  proba_overall == 51 ~ 0.03,
+  proba_overall == 85 ~ 0.22,
+  proba_overall == 119 ~ 0.32,
+  proba_overall == 187 ~ 0.44,
+  proba_overall == 221 ~ 0.52,
+  proba_overall == 102 ~ 0.05,
+  proba_overall == 170 ~ 0.10,
+  proba_overall == 238 ~ 0.13,
+  proba_overall == 374 ~ 0.16,
+  proba_overall == 442 ~ 0.27,
+  proba_overall == 57 ~ 0.04,
+  proba_overall == 95 ~ 0.10,
+  proba_overall == 133 ~ 0.17,
+  proba_overall == 209 ~ 0.26,
+  proba_overall == 247 ~ 0.34,
+  proba_overall == 114 ~ 0.03,
+  proba_overall == 190 ~ 0.06,
+  proba_overall == 266 ~ 0.06,
+  proba_overall == 418 ~ 0.11,
+  proba_overall == 494 ~ 0.19,
+  proba_overall == 69 ~ 0.01,
+  proba_overall == 115 ~ 0.03,
+  proba_overall == 161 ~ 0.11,
+  proba_overall == 253 ~ 0.22,
+  proba_overall == 299 ~ 0.24,
+  proba_overall == 138 ~ 0.01,
+  proba_overall == 230 ~ 0.02,
+  proba_overall == 322 ~ 0.03,
+  proba_overall == 506 ~ 0.06,
+  proba_overall == 598 ~ 0.10,
+  proba_overall == 87 ~ 0.00,
+  proba_overall == 145 ~ 0.12,
+  proba_overall == 203 ~ 0.20,
+  proba_overall == 319 ~ 0.27,
+  proba_overall == 377 ~ 0.32,
+  proba_overall == 174 ~ 0.03,
+  proba_overall == 290 ~ 0.03,
+  proba_overall == 406 ~ 0.09,
+  proba_overall == 638 ~ 0.14,
+  proba_overall == 754 ~ 0.12,
+  # sinon, 99 pour ceux qui ne sont pas analysables pour les exclure après
+  # (car NA ici ne fonctionne pas)
+  proba_overall == 0 ~ 99
+)
+
+spect$proba <- as.numeric(as.character(ifelse(
+  spect$proba==99, NA, spect$proba))
+  )
+
+spect$PPT_range <- ifelse(
+  spect$proba>0.15,">0.15",ifelse(
+    spect$proba>0.05,"0.05-0.15",ifelse(
+      spect$proba>-0.01,"<0.05",NA
+      )
+    )
+  )
+spect$PPT_range <- ordered(spect$PPT_range, levels = c("<0.05", "0.05-0.15", ">0.15"))
+```
+
+### Export csv 
+```{r}
+write.csv2(spect,'resultats_coeur_juil_21.csv', row.names=TRUE)
+```
+
+### Nettoyage
+```{r, message=FALSE, warning=FALSE, results='hide'}
+rm(spect_proba, table, age_par_dizaine)
+rm(list = apropos("proba_"))
+```
+
+# Analyse statistique
+On drop les champs qui ne pourront pas être entrés dans une table
+```{r}
+spect <- spect %>%
+  select(-c(spectdata, nom, prenom, date_exam))
+spect <- droplevels(spect)
+```
+
+## Comparaison périodes
+```{r}
+varsToFactor <- c("gender")
+spect[varsToFactor] <- lapply(spect[varsToFactor], factor)
+
+# Create a variable list
+vars <- c("age", "gender", "cancer", "LBBB", "AF", "BMI", "overweight", "PAR", "Hypertension", "diabetes", "tabacco", "Dyslipidemia",  
+"familial_history_cad", "CVRF", "cmd", "cmi", "history_MI", "cabg", "pci", "revascularization", "dt", "effort", 
+"typique", "dyspnee", "indication_exam", 
+"aap", "antico", "bb", "ivabradine", "statine", "autre_hypolipemiant", "iec", "diuretiques", "ica", "insuline", "ado", "type_stress", "fevg_stress", "vtd_stress", 
+"vts_stress", "fevg_repos", "vtd_repos", "vts_repos", "spect_perfusion", "nb_segment_isch", "signif_ischemia", "nb_segment_IDM", "sent_to_angio")
+table <- CreateTableOne(vars = vars, data = spect, strata=c("groupe"), includeNA = FALSE)
+table <- print(table, printToggle = FALSE, noSpaces = TRUE)
+
+kbl(table) %>%
+kable_styling(latex_options = c("striped", "scale_down"))
+```
+

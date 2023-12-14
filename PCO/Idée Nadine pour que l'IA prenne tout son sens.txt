@@ -1,0 +1,27 @@
+Il faut:
+
+
+ - Analyse exploratoire du jeu d'entraînement (quels caractéristiques ont un lien avec la sortie (malade / non malade))
+
+
+
+ - Extraire des caractéristiques des comptes rendus
+
+
+
+ - Entraîner un modèle d'IA qui prédit quels comptes rendus sont malades ou non malades
+Comparer un modèle entrainé sur les textes et un modèle entrainé sur les caractéristiques extraites.
+Ajouter une colonne avec la confiance de la prédiction.
+
+
+
+ - Voir pour mettre en production le modèle sur les pc des médecins, pour qu'ils aient la prédiction avec l'intervalle de confiance.
+
+
+
+ - Analyser les profils des patients à partir des caractéristiques extraites, 
+quelles caractéristiques jouent un rôle dans le modèle (semblable au premier tiret).
+
+
+
+ - Montrer le fonctionnement interne du modèle développé
