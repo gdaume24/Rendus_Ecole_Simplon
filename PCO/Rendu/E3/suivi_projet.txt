@@ -7,3 +7,8 @@ Compétence(s) visée(s)
 C17. Concevoir un système de veille technologique permettant de collecter, classifier et analyser l’information afin d’améliorer la prise de décisions
 techniques.
 
+
+Un rapport de 2 à 5 pages, comprenant :
+● une première partie de présentation des documents : sources, canal, date, analyse de la pertinence de la source, etc,
+● une seconde partie de synthèse : les tendances du domaine, les conséquences pour la pratique professionnelle, etc.
+
